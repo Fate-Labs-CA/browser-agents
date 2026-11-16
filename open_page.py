@@ -7,6 +7,7 @@ hard timeout ends it. The sandbox is always killed, and E2B kills it at the time
 
     python open_page.py                                    # reddit.com, view-only live link, 5-minute hard timeout
     python open_page.py --url https://example.com/ --browser google-chrome --control --hold 60
+    python open_page.py --proxy                            # traffic leaves through the SOCKS5 proxy in .env
 
 Needs E2B_API_KEY in the environment or in .env. Every run starts a paid sandbox, billed per second while it runs.
 
@@ -44,6 +45,37 @@ RUNNING = "ps -eo comm= | grep -oE 'chrome|firefox|chromium' | sort -u | tr '\\n
 TITLE = 'xdotool getactivewindow getwindowname 2>/dev/null || true'
 
 
+# E2B tunnels only TCP through the proxy; UDP leaves the sandbox directly. HTTP/3 runs over UDP, so with a proxy the
+# browsers must not use it, or some traffic would come from E2B's own address. Browser policies, written as root.
+NO_HTTP3 = r'''
+set -e
+ff='{"policies": {"Preferences": {"network.http.http3.enable": {"Value": false, "Status": "locked"}}}}'
+mkdir -p /etc/firefox/policies /usr/lib/firefox-esr/distribution /etc/opt/chrome/policies/managed
+echo "$ff" > /etc/firefox/policies/policies.json
+echo "$ff" > /usr/lib/firefox-esr/distribution/policies.json
+echo '{"QuicAllowed": false}' > /etc/opt/chrome/policies/managed/no-quic.json
+'''
+
+
+def proxy_settings() -> dict:
+    """E2B's egress proxy from .env: a SOCKS5 proxy, e.g. an Oxylabs ISP IP (isp.oxylabs.io:8001 is the first IP)."""
+    missing = [n for n in ('OXYLABS_PROXY_ADDRESS', 'OXYLABS_PROXY_USERNAME', 'OXYLABS_PROXY_PASSWORD') if not os.environ.get(n)]
+    if missing:
+        raise SystemExit(f'--proxy needs {", ".join(missing)} in .env')
+    return {'address': os.environ['OXYLABS_PROXY_ADDRESS'], 'username': os.environ['OXYLABS_PROXY_USERNAME'],
+            'password': os.environ['OXYLABS_PROXY_PASSWORD']}
+
+
+def exit_ip(desktop: Sandbox) -> dict:
+    """The address the sandbox's traffic leaves from, as the outside world sees it."""
+    out = desktop.commands.run('curl -sS --max-time 20 https://ipinfo.io/json || true', timeout=30).stdout
+    try:
+        info = json.loads(out)
+    except ValueError:
+        return {'error': out[:200]}
+    return {k: info.get(k) for k in ('ip', 'city', 'region', 'country', 'org')}
+
+
 def facts(desktop: Sandbox) -> dict:
     lines = desktop.commands.run(FACTS, timeout=20).stdout.splitlines()
     return {name: value.strip() for name, _, value in (line.partition('=') for line in lines) if name}
@@ -74,6 +106,8 @@ def main() -> int:
     parser.add_argument('--control', action='store_true', help='the live link takes mouse and keyboard too, not just viewing')
     parser.add_argument('--hold', type=float, help='keep it up this many seconds instead of waiting for Enter')
     parser.add_argument('--timeout', type=int, default=300, help='hard timeout, seconds; E2B kills the sandbox then')
+    parser.add_argument('--proxy', action='store_true',
+                        help='send the sandbox\'s traffic through the SOCKS5 proxy in .env (OXYLABS_PROXY_*)')
     args = parser.parse_args()
 
     load_dotenv()
@@ -87,10 +121,19 @@ def main() -> int:
     deadline = began + args.timeout
     desktop = None
     try:
-        desktop = Sandbox.create(timeout=args.timeout, allow_internet_access=True, metadata={'purpose': 'open page'})
+        network = None
+        if args.proxy:
+            network = {'egress_proxy': proxy_settings()}
+            record['proxy'] = network['egress_proxy']['address']  # never the username or password
+        desktop = Sandbox.create(timeout=args.timeout, allow_internet_access=True, metadata={'purpose': 'open page'},
+                                 network=network)
         record.update({'sandbox_id': desktop.sandbox_id, 'create_seconds': round(time.time() - began, 2),
                        'machine': facts(desktop)})
         print(json.dumps({'sandbox': desktop.sandbox_id, 'machine': record['machine']}, indent=2), flush=True)
+        if args.proxy:
+            desktop.commands.run(NO_HTTP3, user='root', timeout=20)
+            record['exit_ip'] = exit_ip(desktop)
+            print(json.dumps({'exit_ip': record['exit_ip']}, indent=2), flush=True)
         if args.browser:
             desktop.launch(args.browser, args.url)
         else:
